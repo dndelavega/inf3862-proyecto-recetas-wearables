@@ -1,0 +1,954 @@
+\documentclass[11pt]{article}
+
+% ============================================================
+% INF3862 - ENTREGA 1
+% Predicción de actividad física diaria
+% Compilador: pdfLaTeX
+% ============================================================
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{float}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usetikzlibrary{
+    arrows.meta,
+    positioning,
+    shapes.geometric,
+    calc
+}
+
+\geometry{left=1cm,right=1cm,top=1cm,bottom=1.6cm}
+
+\definecolor{azul}{HTML}{17365D}
+\definecolor{celeste}{HTML}{EAF1F8}
+\definecolor{verde}{HTML}{28765C}
+\definecolor{gris}{HTML}{555555}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=black
+}
+
+\setlength{\parindent}{1.2em}
+\setlist[enumerate]{itemsep=1pt,topsep=2pt,leftmargin=*}
+\setlist[itemize]{itemsep=1pt,topsep=2pt,leftmargin=*}
+
+\newcommand{\seccion}[1]{\vspace{-1.2ex}\section*{#1}\vspace{-0.6ex}}
+
+\newcommand{\codigo}[1]{\texttt{\small #1}}
+
+\lstdefinestyle{sqlstyle}{
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{azul}\bfseries,
+    commentstyle=\color{gris}\itshape,
+    stringstyle=\color{verde},
+    breaklines=true,
+    showstringspaces=false,
+    frame=single,
+    rulecolor=\color{gray!35},
+    backgroundcolor=\color{gray!4},
+    columns=fullflexible,
+    keepspaces=true,
+    morekeywords={OVER,PARTITION,LEAD,ROWS,PRECEDING,COALESCE,LIMIT,WITH,BEGIN,COMMIT,ROLLBACK,RETURNING}
+}
+\lstset{style=sqlstyle}
+
+\begin{document}
+
+% ============================================================
+% INFORME PRINCIPAL - PÁGINA 1
+% ============================================================
+
+\noindent
+\begin{minipage}[c]{3.3cm}
+  \includegraphics[height=3.95cm]{logo_uc.png}
+\end{minipage}%
+\begin{minipage}[c]{\dimexpr\textwidth-3.6cm\relax}
+  Pontificia Universidad Católica de Chile\\
+  Escuela de Ingeniería\\
+  Magíster en Inteligencia Artificial\\
+  INF3862 - Plataformas Big Data para Data Science\\
+  Cuarto Bimestre 2026
+\end{minipage}
+
+\vspace{0.3cm}
+\begin{center}
+\textbf{Entrega 1: Diseño de datos}\\[2pt]
+Predicción del nivel de actividad física diaria\\[2pt]
+{\small Diego De la Vega \quad | \quad 16 de noviembre de 2026}
+\end{center}
+
+\seccion{1. Objetivo y preguntas guía}
+
+Se diseña la plataforma de datos para \textbf{predecir los pasos
+que dará cada usuario el día siguiente}, con la información recibida
+antes del inicio de ese día. Si lo previsto queda bajo la meta del
+usuario, la app le envía un recordatorio matinal con una actividad o
+receta sugerida. No se buscan relaciones causales ni recomendaciones
+clínicas.
+
+{\small
+\begin{tabularx}{\linewidth}{@{}p{2.1cm}X@{}}
+\toprule
+\textbf{Pregunta} & \textbf{Decisión del proyecto}\\
+\midrule
+Resultado &
+Predicción diaria de pasos por usuario y dashboard histórico de
+actividad, para el usuario de la aplicación y el equipo de producto.
+Decisión: enviar o no el recordatorio matinal.\\
+Datos &
+Mediciones, sesiones y relojes del wearable; comidas registradas y
+catálogo de recetas de Food.com. 61 días de recepción
+(16-dic-2007 a 14-feb-2008), unos 640 MB en total (sección 2).\\
+Operaciones &
+Validar, normalizar los dos modelos de reloj, deduplicar, pasar a
+fecha local, agregar por usuario-día, construir ventanas temporales
+y predecir.\\
+Exigencias &
+Predicción lista antes de las 07:00 locales; lectura en la app en
+menos de 2 s. Se tolera que un día quede incompleto por
+sincronizaciones tardías, pero no duplicados en los agregados.
+El modelo debe superar el error absoluto medio (MAE) del promedio
+histórico del usuario.\\
+Recursos &
+Una persona y presupuesto acotado. Procesamiento local
+(DuckDB/pandas sobre Parquet) antes de distribuir.\\
+\bottomrule
+\end{tabularx}
+}
+
+\textbf{Rol de Food.com.} Las comidas registradas y la energía de
+las recetas preparadas (\codigo{Calories} por porción) entran como
+variables de rutina diaria. Es una hipótesis a contrastar: si no
+mejoran al modelo base, se registrará en el registro de decisiones.
+
+\seccion{2. Fuentes, recepción y calidad}
+
+{\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{1.45cm}>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{3.7cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Fuente} & \textbf{Registro y tipo} & \textbf{Volumen entregado} &
+\textbf{Recepción (modo, frecuencia, latencia aceptable)}\\
+\midrule
+Recetas &
+Una receta; estructurada, con listas &
+522.517 filas; 170 MB Parquet &
+Carga batch del catálogo, mensual; latencia de días.\\
+Reseñas &
+Una reseña; estructurada, con texto &
+1.401.982 filas; 166 MB &
+Batch; solo para validar \codigo{AuthorId} de los usuarios.\\
+Relojes &
+Un reloj y su vinculación; estructurado &
+315 relojes, 300 usuarios; 20 KB &
+Transacción en línea desde la app; menos de 1 s.\\
+Mediciones &
+Una lectura; JSONL semiestructurado &
+15.540.132 filas; 1.450 archivos; 113 MB gz &
+Lotes por sincronización, archivados por hora de recepción;
+basta con que estén al corte diario.\\
+Sesiones &
+Una actividad; JSONL &
+4.840 filas; 764 KB &
+Evento al cerrar la sesión; minutos.\\
+Comidas &
+Una preparación; CSV estructurado &
+22.106 filas; 984 KB &
+Transacción en línea desde la app; menos de 1 s.\\
+\bottomrule
+\end{tabularx}
+}
+
+\textbf{Crecimiento.} Con 315 relojes llegan unas 255 mil lecturas
+por día (cerca de 810 por reloj), es decir, 1,9 MB comprimidos al día
+y unos 56 MB al mes. Para otra cantidad de relojes se escala con
+$V_{\mathrm{dia}} = N_{\mathrm{relojes}} \cdot m_{\mathrm{dia}} \cdot b_{\mathrm{registro}}$,
+con $b_{\mathrm{registro}} \approx 7{,}5$ bytes comprimidos por lectura.
+
+\textbf{Problemas detectados en los datos entregados.}
+\begin{itemize}
+    \item \emph{Duplicados}: 345.599 mediciones repetidas (2,2\,\%), con
+    valores idénticos; 300.015 reaparecen en otro lote con distinto
+    \codigo{ts\_recepcion}, de modo que la clave de deduplicación debe ser
+    (\codigo{device\_id}, \codigo{ts\_medicion}). Sin deduplicar, los pasos
+    se inflan 2,3\,\%. Hay además 48 sesiones duplicadas exactas.
+    \item \emph{Atrasos}: entre la medición y la recepción hay una mediana
+    de 1,2 h, un percentil 90 de 6,5 h, un percentil 99 de 32 h y un máximo
+    de 105 h. El 12\,\% llega en un día posterior al de la medición.
+    \item \emph{Formatos y faltantes}: FitBand 2 (13\,\% de las lecturas)
+    usa otros nombres y fechas en epoch ms (Anexo~\ref{an:norm});
+    frecuencia cardíaca nula en el 2,3\,\%; 48 comidas con
+    \codigo{RecipeId} inexistente.
+\end{itemize}
+
+\textbf{Esquemas.} Los archivos crudos se guardan tal como llegan y
+se leen con \emph{schema-on-read}, porque los dos modelos de reloj
+difieren y conviene poder reprocesarlos. Las tablas operacionales y
+analíticas usan \emph{schema-on-write}, para fijar tipos, claves y
+reglas de calidad antes de consultar.
+
+
+% ============================================================
+% INFORME PRINCIPAL - PÁGINA 2
+% ============================================================
+
+\seccion{3. Modelo operacional (OLTP)}
+
+{\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{1.6cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{4.4cm}@{}}
+\toprule
+\textbf{Entidad} & \textbf{Claves y columnas principales} &
+\textbf{Modelo y motivo}\\
+\midrule
+Usuario &
+\codigo{AuthorId} (PK), fecha de alta, meta de pasos. &
+Relacional: integridad de FK.\\
+Reloj &
+\codigo{device\_id} (PK), modelo. &
+Relacional.\\
+Vinculación &
+\codigo{vinculacion\_id} (PK), \codigo{device\_id} (FK),
+\codigo{AuthorId} (FK), desde, hasta (nulo si activa), zona horaria. &
+Relacional: la regla transaccional vive aquí.\\
+Receta &
+\codigo{RecipeId} (PK), nombre, categoría, \codigo{Calories},
+proteína, porciones; ingredientes como lista JSON. &
+Relacional con columnas documentales.\\
+Comida &
+\codigo{comida\_id} (PK), \codigo{AuthorId} (FK), \codigo{RecipeId} (FK),
+fecha y hora, porciones $> 0$. &
+Relacional: escritura puntual.\\
+Sesión &
+\codigo{session\_id} (PK), \codigo{device\_id} (FK), tipo, inicio, fin,
+distancia, calorías. &
+Relacional: lectura por reloj.\\
+Medición &
+(\codigo{device\_id}, \codigo{ts\_medicion}) (PK), recepción, pasos,
+calorías, frecuencia cardíaca. &
+Serie temporal \emph{append-only}: alto volumen, se lee por reloj y
+rango de tiempo, fuera de la base de la app.\\
+\bottomrule
+\end{tabularx}
+}
+
+\textbf{Regla transaccional.} Un usuario tiene a lo más un reloj
+activo, y un reloj está vinculado a lo más a un usuario. En los datos
+hay 15 usuarios que cambiaron de reloj. El cambio exige cerrar la
+vinculación anterior (\codigo{hasta = now()}) e insertar la nueva en
+una misma transacción (consulta T1). Sin atomicidad, una falla entre
+ambos pasos dejaría al usuario con dos relojes activos o sin ninguno:
+sus pasos se contarían dos veces o se perderían. Dos índices únicos
+parciales sobre \codigo{AuthorId} y \codigo{device\_id}
+(\codigo{WHERE hasta IS NULL}) lo garantizan. El diagrama
+entidad-relación está en el Anexo~\ref{an:er}.
+
+\seccion{4. Modelo analítico (OLAP)}
+
+{\small
+\begin{tabularx}{\linewidth}{@{}p{3.6cm}X@{}}
+\toprule
+\textbf{Elemento} & \textbf{Definición}\\
+\midrule
+\codigo{fact\_actividad\_diaria} &
+\textbf{Una fila por usuario y fecha local.} Claves:
+\codigo{usuario\_key}, \codigo{fecha\_key}. Medidas: pasos totales,
+calorías de actividad, minutos con lectura (cobertura), cantidad y
+duración de sesiones.\\
+\codigo{fact\_comida} &
+\textbf{Una fila por comida registrada.} Claves: \codigo{usuario\_key},
+\codigo{fecha\_key}, \codigo{receta\_key}. Medidas: porciones, energía
+preparada (porciones $\times$ \codigo{Calories}).\\
+\codigo{dim\_usuario} &
+\codigo{AuthorId}, zona horaria, modelo del reloj activo, meta de pasos.\\
+\codigo{dim\_fecha} &
+Fecha, día de la semana, fin de semana, mes.\\
+\codigo{dim\_receta} &
+\codigo{RecipeId}, categoría, calorías, proteína y tiempo de preparación.\\
+\bottomrule
+\end{tabularx}
+}
+
+Las dos tablas de hechos comparten las dimensiones de usuario y fecha
+(Anexo~\ref{an:dim}), así que la nutrición se agrega por usuario y día
+sin multiplicar las filas de actividad. La energía de las recetas es
+la \emph{preparada y registrada}, no el consumo confirmado. La
+cobertura distingue un día de 0 pasos de un día sin el reloj puesto.
+
+\textbf{Ubicación y formato.} Se usa un \emph{Lakehouse}: los datos
+crudos (JSONL.gz, CSV y Parquet originales) quedan en almacenamiento
+de objetos; las capas limpia y analítica, en Parquet columnar, y en
+la E3 se evaluará un formato de tabla (Delta o Iceberg). El
+almacenamiento columnar conviene porque las consultas analíticas leen
+pocas columnas (pasos, fecha, usuario) de muchas filas.
+
+\textbf{Partición.} Los crudos conservan la partición por fecha de
+\emph{recepción}. La capa limpia se particiona por fecha local de
+\emph{medición}, lo que favorece a A1 y A3, que filtran por rango de
+fechas. Un lote tardío solo obliga a reescribir las particiones de
+las fechas que toca. Como los pasos y las calorías de cada lectura son
+incrementos desde la lectura anterior, el total diario es la suma tras
+deduplicar. La fecha local se obtiene con la zona horaria de la
+vinculación vigente en el momento de la medición.
+
+
+% ============================================================
+% INFORME PRINCIPAL - PÁGINA 3
+% ============================================================
+
+\seccion{5. Consultas y patrones de acceso}
+
+El SQL, el usuario, la frecuencia, la latencia y la aceleración de
+cada consulta están en el Anexo~\ref{an:sql}.
+
+{\small
+\begin{tabularx}{\linewidth}{@{}p{0.6cm}>{\raggedright\arraybackslash}p{1.9cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{4.3cm}@{}}
+\toprule
+\textbf{ID} & \textbf{Clase} & \textbf{Propósito} & \textbf{Qué la acelera}\\
+\midrule
+T1 & OLTP, escribe &
+Cambio de reloj: cierra la vinculación activa y crea la nueva
+(\codigo{BEGIN ... COMMIT/ROLLBACK}). &
+Índices únicos parciales.\\
+T2 & OLTP, escribe &
+Registrar una comida desde la app. &
+PK e índices de FK.\\
+T3 & OLTP, lee &
+Reloj activo y zona horaria de un usuario. &
+Índice por \codigo{(AuthorId, hasta)}.\\
+T4 & OLTP, lee &
+Últimas diez sesiones de un reloj. &
+Índice por \codigo{(device\_id, inicio)}.\\
+A1 & OLAP &
+Promedio y total de pasos por usuario en un período (también es el
+modelo de referencia). &
+Parquet y poda por fecha.\\
+A2 & OLAP &
+Actividad diaria frente a energía de las recetas preparadas. &
+Columnar; resumen usuario-día.\\
+A3 & OLAP &
+Dataset de predicción: ventanas de 7 días y pasos del día siguiente.
+\textbf{Responde el objetivo.} &
+Partición por fecha; variables materializadas.\\
+\bottomrule
+\end{tabularx}
+}
+
+Las consultas OLTP tocan una o pocas filas, son muy frecuentes y
+concurrentes y deben responder en milisegundos. Las OLAP recorren
+historiales completos con agregaciones y ventanas, corren en batch y
+toleran segundos o minutos.
+
+\textbf{Consulta fronteriza.} El promedio de pasos de los últimos 7
+días, que la app muestra al abrirse, es analítico por su cálculo
+(una ventana sobre el historial) pero operacional por su uso (miles de
+lecturas concurrentes, menos de 2 s). Ejecutarlo sobre la base OLTP o
+sobre las mediciones crudas competiría con la operación. Por eso se
+calcula en el batch diario de la capa analítica, se publica en una
+tabla resumen o caché indexada por usuario y la app solo la lee.
+
+\seccion{6. Arquitectura inicial}
+
+La aplicación escribe usuarios, vinculaciones y comidas en una base
+operacional, que se extrae a diario hacia la zona cruda. Los archivos
+de Food.com y los lotes de mediciones y sesiones llegan directo al
+almacenamiento de objetos; el catálogo de recetas se carga además en
+la base operacional, que lo necesita para validar comidas. Un proceso
+diario normaliza los modelos de reloj, deduplica, pasa a fecha local y
+valida referencias, primero hacia la capa limpia y luego hacia la
+analítica. Esta alimenta el dashboard, el modelo y la tabla resumen
+que lee la app. Los lotes tardíos reprocesan solo las fechas afectadas
+mediante sobrescritura de partición, que es idempotente. El diagrama
+está en el Anexo~\ref{an:arq}.
+
+\seccion{7. Proyección}
+
+En la E2 se implementará el pipeline sobre una muestra, con las reglas
+de calidad de la sección 2 (con su conteo de registros afectados), la
+capa limpia particionada en Parquet y las consultas A1--A3. En la E3
+se entrenará un modelo base frente a la referencia del promedio
+histórico, con separación temporal de 42, 9 y 9 días para
+entrenamiento, validación y prueba. Para evitar fugas, cada predicción
+del día $d+1$ usará solo lecturas con \codigo{ts\_recepcion} anterior
+al corte de las 00:00 locales; dado el atraso observado, el día $d$
+llega incompleto al corte, y así se reproducirá también en
+entrenamiento. Con unos 113 MB comprimidos, el caso no justifica hoy
+procesamiento distribuido.
+
+% ============================================================
+% ANEXOS - NO CUENTAN EN LAS 3 PÁGINAS DEL INFORME
+% ============================================================
+
+\clearpage
+\appendix
+
+\begin{center}
+{\Large\textbf{Anexos}}\\[3pt]
+{\small Material de apoyo; no forma parte de las 3 páginas del informe.}
+\end{center}
+\vspace{-0.4cm}
+
+\section{Modelo entidad-relación operacional}\label{an:er}
+
+\begin{center}
+\begin{tikzpicture}[
+    entity/.style={
+        draw=azul,
+        fill=celeste,
+        rounded corners,
+        align=left,
+        text width=4.1cm,
+        inner sep=5pt,
+        font=\footnotesize
+    },
+    rel/.style={-{Latex[length=2mm]},thick},
+    lab/.style={font=\footnotesize, fill=white, inner sep=1pt}
+]
+\node[entity] (usuario) at (-5.6,0)
+{\textbf{USUARIO}\\
+PK: AuthorId\\
+fecha\_alta, meta\_pasos};
+
+\node[entity] (comida) at (0,0)
+{\textbf{COMIDA}\\
+PK: comida\_id\\
+FK: AuthorId, RecipeId\\
+fecha\_hora, porciones};
+
+\node[entity] (receta) at (5.6,0)
+{\textbf{RECETA}\\
+PK: RecipeId\\
+nombre, categoría\\
+Calories, proteína, porciones};
+
+\node[entity] (vinc) at (-5.6,-3.4)
+{\textbf{VINCULACIÓN}\\
+PK: vinculacion\_id\\
+FK: AuthorId, device\_id\\
+desde, hasta (nulo = activa)\\
+zona\_horaria};
+
+\node[entity] (reloj) at (0,-3.4)
+{\textbf{RELOJ}\\
+PK: device\_id\\
+modelo};
+
+\node[entity] (sesion) at (5.6,-3.4)
+{\textbf{SESIÓN}\\
+PK: session\_id\\
+FK: device\_id\\
+tipo, inicio, fin\\
+distancia\_km, calorías};
+
+\node[entity] (medicion) at (0,-6.6)
+{\textbf{MEDICIÓN}\\ \emph{serie temporal}\\
+PK: device\_id, ts\_medicion\\
+ts\_recepcion\\
+pasos, calorías, FC};
+
+\draw[rel] (usuario) -- node[lab,above]{1:N} (comida);
+\draw[rel] (receta) -- node[lab,above]{1:N} (comida);
+\draw[rel] (usuario) -- node[lab,right]{1:N} (vinc);
+\draw[rel] (reloj) -- node[lab,above]{1:N} (vinc);
+\draw[rel] (reloj) -- node[lab,above]{1:N} (sesion);
+\draw[rel] (reloj) -- node[lab,right]{1:N} (medicion);
+\end{tikzpicture}
+\end{center}
+
+La entidad MEDICIÓN es una estructura lógica. Por su volumen se
+guarda en el almacenamiento de objetos y en la capa limpia, no en la
+base transaccional de la aplicación.
+
+\textbf{Reglas de integridad:}
+\begin{itemize}
+    \item Una comida referencia un usuario y una receta existentes
+    (hoy fallan 48), con porciones mayores que cero.
+    \item A lo más una vinculación activa por usuario y por reloj
+    (índices únicos parciales; el cambio se hace con T1).
+    \item Una sesión referencia un reloj válido y cumple
+    \codigo{fin > inicio}; \codigo{session\_id} es único (hoy hay 48
+    duplicados exactos).
+    \item Una medición es única por (\codigo{device\_id},
+    \codigo{ts\_medicion}) y cae dentro de un período de vinculación
+    de su reloj.
+\end{itemize}
+
+\clearpage
+\section{Arquitectura inicial}\label{an:arq}
+
+\begin{center}
+\begin{tikzpicture}[
+    box/.style={
+        draw=azul,
+        fill=celeste,
+        rounded corners,
+        align=center,
+        minimum height=1.05cm,
+        text width=4cm,
+        font=\footnotesize
+    },
+    src/.style={box, draw=verde, fill=green!7},
+    arr/.style={-{Latex[length=2mm]},thick},
+    lab/.style={font=\scriptsize, fill=white, inner sep=1pt}
+]
+% Fuentes
+\node[src] (app) at (-5.6,0)
+{\textbf{App móvil}\\Comidas y vinculaciones};
+\node[src] (food) at (0,0)
+{\textbf{Food.com}\\Recetas y reseñas (archivos)};
+\node[src] (wear) at (5.6,0)
+{\textbf{Relojes}\\Mediciones y sesiones};
+
+% Recepción
+\node[box] (oltp) at (-5.6,-2.3)
+{\textbf{Base operacional}\\Transacciones en línea};
+\node[box] (batch) at (0,-2.3)
+{\textbf{Carga batch}\\Mensual};
+\node[box] (lotes) at (5.6,-2.3)
+{\textbf{Recepción de lotes}\\JSONL.gz por sincronización};
+
+% Almacenamiento
+\node[box] (raw) at (0,-4.6)
+{\textbf{Almacenamiento de objetos}\\Crudo (bronze), por fecha de recepción};
+\node[box] (silver) at (0,-6.6)
+{\textbf{Normalización y calidad}\\Parquet limpio (silver), por fecha local};
+\node[box] (gold) at (0,-8.6)
+{\textbf{Modelo dimensional}\\Hechos, dimensiones y variables (gold)};
+
+% Consumo
+\node[box] (dash) at (-5.6,-10.9)
+{\textbf{Dashboard}\\Actividad histórica};
+\node[box] (ml) at (0,-10.9)
+{\textbf{Modelo predictivo}\\Pasos del día siguiente};
+\node[box] (cache) at (5.6,-10.9)
+{\textbf{Tabla resumen / caché}\\Promedio 7 días y predicción};
+
+\draw[arr] (app) -- (oltp);
+\draw[arr] (food) -- (batch);
+\draw[arr] (wear) -- (lotes);
+\draw[arr] (batch) -- (raw);
+\draw[arr] (lotes) |- (raw);
+\draw[arr] (oltp) |- node[lab,pos=0.75,above]{extracción diaria} (raw);
+\draw[arr,dashed] (batch) -- node[lab,above]{catálogo} (oltp);
+\draw[arr] (raw) -- (silver);
+\draw[arr] (silver) -- (gold);
+\draw[arr] (gold) -| (dash);
+\draw[arr] (gold) -- (ml);
+\draw[arr] (gold) -| (cache);
+\draw[arr] (ml) -- (cache);
+\draw[arr,dashed] (cache.east) -- ++(0.45,0) |- node[lab,pos=0.25,right]{lectura de la app} ($(app.north)+(0,0.55)$) -- (app.north);
+\end{tikzpicture}
+\end{center}
+
+\section{Modelo dimensional}\label{an:dim}
+
+\begin{center}
+\begin{tikzpicture}[
+    dim/.style={
+        draw=verde,
+        fill=green!7,
+        rounded corners,
+        align=left,
+        text width=3.9cm,
+        inner sep=5pt,
+        font=\footnotesize
+    },
+    fact/.style={
+        draw=azul,
+        fill=celeste,
+        rounded corners,
+        align=left,
+        text width=5.3cm,
+        inner sep=5pt,
+        font=\footnotesize
+    },
+    arr/.style={-{Latex[length=2mm]},thick}
+]
+\node[fact] (f) at (-5.6,0)
+{\textbf{FACT\_ACTIVIDAD\_DIARIA}\\
+\emph{una fila por usuario y fecha local}\\
+PK: usuario\_key, fecha\_key\\
+pasos\_totales\\
+calorias\_actividad\\
+minutos\_con\_lectura\\
+cantidad\_sesiones\\
+duracion\_sesiones\_min};
+
+\node[dim] (u) at (0,1.7)
+{\textbf{DIM\_USUARIO}\\
+usuario\_key, AuthorId\\
+zona\_horaria\\ modelo\_reloj\\
+meta\_pasos};
+
+\node[dim] (d) at (0,-1.7)
+{\textbf{DIM\_FECHA}\\
+fecha\_key, fecha\\
+dia\_semana, fin\_de\_semana\\
+mes};
+
+\node[fact] (c) at (5.6,0)
+{\textbf{FACT\_COMIDA}\\
+\emph{una fila por comida registrada}\\
+comida\_id\\
+usuario\_key, fecha\_key\\
+receta\_key\\
+porciones, energia\_kcal};
+
+\node[dim] (r) at (5.6,-3.6)
+{\textbf{DIM\_RECETA}\\
+receta\_key, RecipeId\\
+categoría, Calories\\
+proteína, tiempo\_total};
+
+\draw[arr] (f) -- (u);
+\draw[arr] (f) -- (d);
+\draw[arr] (c) -- (u);
+\draw[arr] (c) -- (d);
+\draw[arr] (c) -- (r);
+\end{tikzpicture}
+\end{center}
+
+Las dos tablas de hechos comparten dimensiones conformadas de usuario
+y fecha. Así se cruza la nutrición con la actividad sin duplicar los
+pasos de un mismo día.
+
+\section{Consultas SQL y justificación}\label{an:sql}
+
+\subsection{T1. Cambiar de reloj (escritura transaccional)}
+
+\textbf{Usuario:} la aplicación, cuando el usuario vincula un reloj
+nuevo. \textbf{Propósito:} reemplazar el reloj activo de un usuario.
+
+\begin{lstlisting}[language=SQL]
+BEGIN;
+
+-- 1. Cerrar la vinculacion activa del usuario (si existe)
+UPDATE vinculaciones
+SET hasta = now()
+WHERE AuthorId = :usuario
+  AND hasta IS NULL;
+
+-- 2. Crear la nueva; falla si el reloj ya esta activo en otro
+--    usuario (indice unico parcial sobre device_id)
+INSERT INTO vinculaciones
+    (device_id, AuthorId, desde, hasta, zona_horaria)
+VALUES
+    (:device_id, :usuario, now(), NULL, :zona_horaria);
+
+COMMIT;
+-- Ante cualquier error: ROLLBACK; queda la vinculacion previa
+\end{lstlisting}
+
+\textbf{Clasificación: OLTP.} Escribe dos filas (una actualizada y
+una insertada). Es infrecuente por usuario, pero concurrente entre
+usuarios; latencia objetivo menor a 200 ms.
+\textbf{Sin transacción:} si el \codigo{INSERT} fallara tras el
+\codigo{UPDATE}, el usuario quedaría sin reloj activo y sus
+mediciones no se asignarían a nadie. Si se ejecutaran en orden
+inverso sin aislamiento, habría un intervalo con dos relojes activos
+y los pasos de ese día se sumarían dos veces.
+\textbf{Qué la acelera:} índices únicos parciales
+\codigo{(AuthorId) WHERE hasta IS NULL} y
+\codigo{(device\_id) WHERE hasta IS NULL}, que además imponen la regla.
+
+\subsection{T2. Registrar una comida}
+
+\textbf{Usuario:} la aplicación.
+
+\begin{lstlisting}[language=SQL]
+INSERT INTO comidas (comida_id, AuthorId, RecipeId,
+                     fecha_hora, porciones)
+VALUES (:comida_id, :usuario, :receta, :fecha_hora, :porciones);
+-- Rechazada por la base si la receta no existe (FK)
+-- o si porciones <= 0 (CHECK)
+\end{lstlisting}
+
+\textbf{Clasificación: OLTP.} Escribe una fila; frecuente (varias
+comidas por usuario al día) y concurrente; menos de 200 ms. Al ser una
+sola sentencia, ya es atómica. \textbf{Qué la acelera:} PK y
+verificación de FK por índice sobre \codigo{recetas(RecipeId)} y
+\codigo{usuarios(AuthorId)}.
+
+\subsection{T3. Reloj activo de un usuario}
+
+\textbf{Usuario:} la aplicación, al abrirse y al sincronizar.
+
+\begin{lstlisting}[language=SQL]
+SELECT v.device_id, r.modelo, v.zona_horaria
+FROM vinculaciones v
+JOIN relojes r ON r.device_id = v.device_id
+WHERE v.AuthorId = :usuario
+  AND v.hasta IS NULL;
+\end{lstlisting}
+
+\textbf{Clasificación: OLTP.} Lee una fila; varias veces por sesión
+de uso; alta concurrencia; menos de 100 ms. \textbf{Qué la acelera:}
+índice \codigo{(AuthorId, hasta)}.
+
+\subsection{T4. Sesiones recientes de un reloj}
+
+\textbf{Usuario:} la aplicación (historial de actividades).
+
+\begin{lstlisting}[language=SQL]
+SELECT session_id, tipo, inicio, fin, distancia_km
+FROM sesiones
+WHERE device_id = :device_id
+ORDER BY inicio DESC
+LIMIT 10;
+\end{lstlisting}
+
+\textbf{Clasificación: OLTP.} Lee diez filas; frecuente; alta
+concurrencia; menos de 100 ms. \textbf{Qué la acelera:} índice
+compuesto \codigo{(device\_id, inicio)}, que entrega las filas ya
+ordenadas sin recorrer la tabla.
+
+\subsection{A1. Actividad histórica por usuario}
+
+\textbf{Usuario:} analista, y el proceso de entrenamiento para el
+modelo de referencia.
+
+\begin{lstlisting}[language=SQL]
+SELECT usuario_key,
+       AVG(pasos_totales) AS promedio_pasos,
+       SUM(pasos_totales) AS pasos_periodo,
+       COUNT(*)           AS dias_con_datos
+FROM fact_actividad_diaria
+WHERE fecha_key BETWEEN :inicio AND :fin
+  AND minutos_con_lectura >= :cobertura_minima
+GROUP BY usuario_key;
+\end{lstlisting}
+
+\textbf{Clasificación: OLAP.} Lee todas las filas usuario-día del
+período (unas 18 mil con los datos actuales) y solo cuatro columnas.
+Se ejecuta a diario o bajo demanda, con baja concurrencia, y tolera
+segundos. \textbf{Qué la acelera:} formato columnar y poda de
+particiones por fecha.
+
+\subsection{A2. Actividad y energía de las recetas preparadas}
+
+\textbf{Usuario:} analista. Primero se agregan las comidas por
+usuario y día, para no multiplicar las filas de actividad.
+
+\begin{lstlisting}[language=SQL]
+WITH comidas_dia AS (
+    SELECT usuario_key, fecha_key,
+           COUNT(*)         AS numero_comidas,
+           SUM(energia_kcal) AS energia_preparada
+           -- energia_kcal = porciones * Calories (por porcion)
+    FROM fact_comida
+    GROUP BY usuario_key, fecha_key
+)
+SELECT d.fin_de_semana,
+       AVG(a.pasos_totales)                  AS pasos_promedio,
+       AVG(COALESCE(c.energia_preparada, 0)) AS energia_promedio,
+       AVG(COALESCE(c.numero_comidas, 0))    AS comidas_promedio
+FROM fact_actividad_diaria a
+JOIN dim_fecha d    ON d.fecha_key = a.fecha_key
+LEFT JOIN comidas_dia c
+       ON c.usuario_key = a.usuario_key
+      AND c.fecha_key   = a.fecha_key
+GROUP BY d.fin_de_semana;
+\end{lstlisting}
+
+\textbf{Clasificación: OLAP.} Combina dos tablas de hechos y una
+dimensión y agrega todo el historial (unas 22 mil comidas y 18 mil
+usuario-días; millones a escala). Es exploratoria, con baja
+concurrencia, y tolera segundos. \textbf{Qué la acelera:} formato
+columnar y materializar \codigo{comidas\_dia} como tabla resumen,
+que reutiliza A3.
+
+\subsection{A3. Dataset para predecir pasos (responde el objetivo)}
+
+\textbf{Usuario:} proceso de entrenamiento y de predicción diaria.
+Supone una tabla diaria continua por usuario, con una política
+explícita para los días sin lecturas (cobertura igual a cero).
+
+\begin{lstlisting}[language=SQL]
+WITH base AS (
+    SELECT a.usuario_key, a.fecha_key, a.pasos_totales,
+           a.minutos_con_lectura, a.cantidad_sesiones,
+           COALESCE(c.energia_preparada, 0) AS energia_preparada
+    FROM fact_actividad_diaria a
+    LEFT JOIN comidas_dia c          -- resumen materializado de A2
+           ON c.usuario_key = a.usuario_key
+          AND c.fecha_key   = a.fecha_key
+),
+variables AS (
+    SELECT *,
+        AVG(pasos_totales) OVER w7       AS promedio_pasos_7d,
+        SUM(cantidad_sesiones) OVER w7   AS sesiones_7d,
+        SUM(energia_preparada) OVER w7   AS energia_preparada_7d,
+        LEAD(pasos_totales, 1) OVER (
+            PARTITION BY usuario_key ORDER BY fecha_key
+        ) AS pasos_dia_siguiente                 -- objetivo
+    FROM base
+    WINDOW w7 AS (PARTITION BY usuario_key ORDER BY fecha_key
+                  ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+)
+SELECT *
+FROM variables
+WHERE pasos_dia_siguiente IS NOT NULL;
+\end{lstlisting}
+
+\textbf{Clasificación: OLAP.} Es un batch que ordena el historial de
+cada usuario y calcula ventanas. Lee todas las filas usuario-día,
+corre a diario o en cada entrenamiento y tolera minutos.
+\textbf{Qué la acelera:} partición por fecha, lectura columnar y
+materialización de las variables.
+
+\textbf{Control de fuga.} Las variables usan solo días hasta $d$ y el
+objetivo es el día $d+1$. Además, la \codigo{fact\_actividad\_diaria}
+de entrenamiento se reconstruye con las lecturas cuya
+\codigo{ts\_recepcion} es anterior al corte (00:00 local de $d+1$).
+Así el modelo ve el día $d$ incompleto, igual que en producción,
+donde el 12\,\% de las lecturas llega después.
+
+\subsection{Consulta fronteriza: promedio reciente en la app}
+
+\begin{lstlisting}[language=SQL]
+SELECT promedio_pasos_7d, pasos_previstos_manana
+FROM resumen_actividad_usuario     -- publicada por el batch diario
+WHERE usuario_key = :usuario;
+\end{lstlisting}
+
+El cálculo es analítico (una ventana sobre el historial), pero la
+consulta es operacional: la hace cada usuario al abrir la app, con
+alta concurrencia y respuesta en menos de 2 s. Se clasifica como OLTP
+de lectura sobre un resultado OLAP precalculado. Se ejecuta fuera de
+la base operacional, en la tabla resumen o caché, para no competir
+con T1--T4.
+
+\section{Normalización de mediciones}\label{an:norm}
+
+\begin{tabularx}{\linewidth}{@{}p{4.2cm}p{5.2cm}X@{}}
+\toprule
+\textbf{Campo común} & \textbf{Pulso S} & \textbf{FitBand 2}\\
+\midrule
+device\_id & device\_id & dev\\
+ts\_medicion (UTC) & ts\_medicion (ISO 8601) & timestamp (epoch ms)\\
+ts\_recepcion (UTC) & ts\_recepcion & received\_at\\
+frecuencia\_cardiaca & frecuencia\_cardiaca & fc\\
+pasos & pasos & steps\\
+calorias & calorias & kcal\\
+\bottomrule
+\end{tabularx}
+
+\subsection*{Reglas de calidad propuestas (se medirán en la E2)}
+
+\begin{enumerate}
+    \item Renombrar los campos al esquema común y convertir las fechas
+    a \codigo{timestamp} UTC.
+    \item Deduplicar por (\codigo{device\_id}, \codigo{ts\_medicion}),
+    conservando la primera recepción. Se esperan 345.599 filas
+    eliminadas; la deduplicación por fila completa solo eliminaría
+    45.584.
+    \item Rechazar pasos o calorías negativos (hoy no hay casos).
+    \item Aceptar frecuencia cardíaca nula y reportar la tasa
+    (2,3\,\%).
+    \item Asignar cada lectura a la vinculación vigente y derivar la
+    fecha local con su \codigo{zona\_horaria} (cuatro zonas de EE.\,UU.).
+    \item Descartar comidas con \codigo{RecipeId} inexistente (48) y
+    sesiones duplicadas (48).
+    \item Reprocesar, con sobrescritura de partición, las fechas
+    locales afectadas por lotes tardíos.
+\end{enumerate}
+
+Pulso S mide cada minuto y FitBand 2 cada cinco; durante una sesión,
+ambos miden cada 10 segundos. La cantidad de lecturas no equivale a
+la cantidad de pasos: cada lectura trae el incremento desde la
+anterior.
+
+\section{Volumen, estimaciones y supuestos}
+
+\begin{tabularx}{\linewidth}{@{}p{4.2cm}X@{}}
+\toprule
+\textbf{Magnitud} & \textbf{Valor}\\
+\midrule
+Recetas Food.com & 522.517 (170 MB Parquet).\\
+Reseñas Food.com & 1.401.982 de 271.907 usuarios (166 MB Parquet).\\
+Relojes & 315 (198 Pulso S y 117 FitBand 2), 300 usuarios,
+15 desvinculados.\\
+Período & 61 días de recepción, del 16-dic-2007 al 14-feb-2008.\\
+Archivos de mediciones & 1.450 archivos horarios .jsonl.gz (113 MB).\\
+Mediciones & 15.540.132 filas (15.194.533 tras deduplicar).\\
+Sesiones y comidas & 4.840 y 22.106 filas.\\
+Crecimiento con 315 relojes & unas 255 mil lecturas al día;
+1,9 MB al día y 56 MB al mes, comprimidos.\\
+\bottomrule
+\end{tabularx}
+
+Para un reloj con $h$ horas al día fuera de sesión y $s$ horas en
+sesión, el máximo teórico de lecturas es:
+\[
+m_{\mathrm{PulsoS}} \approx 60h + 360s,
+\qquad
+m_{\mathrm{FitBand2}} \approx 12h + 360s,
+\qquad h + s \le 24.
+\]
+El promedio observado (unas 810 lecturas por reloj al día) queda bajo
+el máximo de Pulso S (1.440), lo que indica horas sin el reloj puesto.
+Por eso la cobertura se incluye como medida.
+
+\section{Registro inicial de decisiones}
+
+\begin{longtable}{@{}p{2.6cm}p{4.9cm}p{6.5cm}@{}}
+\toprule
+\textbf{Decisión} & \textbf{Alternativa elegida} &
+\textbf{Justificación}\\
+\midrule
+\endhead
+Objetivo & Predecir los pasos del día siguiente &
+Variable observable; apoya el recordatorio matinal.\\
+Operacional & Relacional, con vinculación separada del reloj &
+Permite el historial de cambios de reloj y la regla de un activo.\\
+Mediciones & Serie temporal fuera de la base OLTP &
+15,5 M de filas en 61 días; se leen por reloj y rango de tiempo.\\
+Analítico & Esquema en estrella con dos hechos &
+Evita mezclar las granularidades usuario-día y comida.\\
+Crudos & Archivos originales en objetos &
+Trazabilidad y reprocesamiento.\\
+Limpios & Parquet particionado por fecha local &
+Compresión, lectura columnar y poda por fecha.\\
+Arquitectura & Lakehouse &
+Separa las capas cruda, limpia y analítica a bajo costo.\\
+Escala & Procesamiento local &
+113 MB comprimidos; no hay evidencia que justifique distribuir.\\
+Deduplicación & Clave (device\_id, ts\_medicion) &
+300.015 duplicados llegan con otra hora de recepción.\\
+Temporalidad & UTC, más fecha local por vinculación &
+Asignar los pasos al día correcto del usuario.\\
+Validación ML & Corte por ts\_recepcion y separación temporal &
+Evita la fuga por lecturas que llegan tarde.\\
+\bottomrule
+\end{longtable}
+
+\section{Fuentes y referencias}
+
+\begin{enumerate}
+    \item INF3862. \emph{Una plataforma de datos para recetas y
+    wearables}. Enunciado del proyecto, entregas E1--E3.
+    \item INF3862. \emph{Clase 00}. Preguntas guía para el diseño de
+    plataformas.
+    \item INF3862. \emph{Clase 01: Almacenamiento de Datos}. OLTP, OLAP,
+    modelos de datos y arquitecturas analíticas.
+    \item Equipo docente. \emph{LEEME.md y diccionario de datos del
+    wearable}.
+    \item Food.com -- Recipes and Reviews.
+    \url{https://www.kaggle.com/datasets/irkaal/foodcom-recipes-and-reviews}
+\end{enumerate}
+
+\end{document}
