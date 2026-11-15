@@ -1,0 +1,6 @@
+datos/*
+!datos/README.md
+*.aux
+*.log
+*.out
+.DS_Store
