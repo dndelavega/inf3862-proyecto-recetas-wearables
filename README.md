@@ -38,11 +38,21 @@ registradas y el catálogo de recetas de Food.com.
 └── entregas/
     └── E1/
         ├── informe.pdf
-        └── anexos/      fuente LaTeX del informe
+        └── anexos/      fuente LaTeX del informe y script de inventario de datos
 ```
 
 A partir de la E2 se agregarán `pyproject.toml` y `uv.lock`, junto con el notebook en
 `entregas/E2/src/`. El entorno se preparará con `uv sync` y se ejecutará con `uv run`.
+
+## Reproducir las cifras de datos de la E1
+
+Todas las cifras de volumen y calidad de datos del informe salen de
+[`entregas/E1/anexos/inventario_datos.py`](entregas/E1/anexos/inventario_datos.py),
+que requiere `duckdb`:
+
+```bash
+python entregas/E1/anexos/inventario_datos.py datos/datos_proyecto_INF3862
+```
 
 ## Compilar el informe de la E1
 

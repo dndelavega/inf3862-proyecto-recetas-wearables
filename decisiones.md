@@ -12,7 +12,8 @@ indicando la entrega en que cambió y el motivo; las filas anteriores se conserv
 | 2026-11-15 | Datos crudos | Archivos originales en almacenamiento de objetos | Cargar directo a tablas | Trazabilidad y reprocesamiento | E1 |
 | 2026-11-15 | Datos limpios | Parquet particionado por fecha local de medición | CSV; partición por fecha de recepción | Compresión, lectura columnar y poda por fecha | E1 |
 | 2026-11-15 | Arquitectura | Lakehouse | Data Warehouse; Data Lake sin capas | Separa las capas cruda, limpia y analítica a bajo costo | E1 |
-| 2026-11-15 | Escala | Procesamiento local (DuckDB/pandas) | Spark | 113 MB comprimidos; no hay evidencia que justifique distribuir | E1 |
+| 2026-11-15 | Escala | Procesamiento local (DuckDB/pandas) | Spark | 115 MB comprimidos; no hay evidencia que justifique distribuir | E1 |
 | 2026-11-15 | Deduplicación | Clave (device_id, ts_medicion) | Fila completa | 300.015 duplicados llegan con otra hora de recepción | E1 |
 | 2026-11-15 | Temporalidad | UTC, más fecha local según la vinculación | Solo UTC | Asignar los pasos al día correcto del usuario | E1 |
 | 2026-11-15 | Validación ML | Corte por ts_recepcion y separación temporal 42/9/9 días | Separación aleatoria | Evita la fuga por lecturas que llegan tarde | E1 |
+| 2026-11-16 | Días sin lecturas | Calendario continuo por usuario; objetivos sin cobertura mínima excluidos del entrenamiento | Rellenar con cero pasos; usar LEAD sobre las filas con datos | Un día sin reloj no equivale a 0 pasos; las ventanas deben ser de 7 días calendario | E1 |
