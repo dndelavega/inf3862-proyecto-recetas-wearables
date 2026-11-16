@@ -8,14 +8,14 @@ datos/
 └── datos_proyecto_INF3862/
     ├── LEEME.md
     ├── foodcom/
-    │   ├── recipes.parquet     522.517 recetas (170 MB)
-    │   └── reviews.parquet     1.401.982 reseñas (166 MB)
+    │   ├── recipes.parquet     522.517 recetas (179 MB)
+    │   └── reviews.parquet     1.401.982 reseñas (174 MB)
     └── wearable/
         ├── LEEME.md            diccionario de datos del wearable
         ├── dispositivos.csv    315 relojes de 300 usuarios
         ├── comidas.csv         22.106 comidas registradas
         ├── sesiones.jsonl      4.840 sesiones
-        └── mediciones/         1.450 archivos AAAA-MM-DD/HH.jsonl.gz (113 MB, 15.540.132 lecturas)
+        └── mediciones/         1.449 archivos AAAA-MM-DD/HH.jsonl.gz (115 MB, 15.540.132 lecturas)
 ```
 
 Fuente de Food.com: [Food.com – Recipes and Reviews](https://www.kaggle.com/datasets/irkaal/foodcom-recipes-and-reviews)
