@@ -114,7 +114,7 @@ Decisión: enviar o no el recordatorio matinal.\\
 Datos &
 Mediciones, sesiones y relojes del wearable; comidas registradas y
 catálogo de recetas de Food.com. 61 días de recepción
-(16-dic-2007 a 14-feb-2008), unos 640 MB en total (sección 2).\\
+(16-dic-2007 a 14-feb-2008), unos 470 MB en total (sección 2).\\
 Operaciones &
 Validar, normalizar los dos modelos de reloj, deduplicar, pasar a
 fecha local, agregar por usuario-día, construir ventanas temporales
@@ -147,11 +147,11 @@ mejoran al modelo base, se registrará en el registro de decisiones.
 \midrule
 Recetas &
 Una receta; estructurada, con listas &
-522.517 filas; 170 MB Parquet &
+522.517 filas; 179 MB Parquet &
 Carga batch del catálogo, mensual; latencia de días.\\
 Reseñas &
 Una reseña; estructurada, con texto &
-1.401.982 filas; 166 MB &
+1.401.982 filas; 174 MB &
 Batch; solo para validar \codigo{AuthorId} de los usuarios.\\
 Relojes &
 Un reloj y su vinculación; estructurado &
@@ -159,16 +159,16 @@ Un reloj y su vinculación; estructurado &
 Transacción en línea desde la app; menos de 1 s.\\
 Mediciones &
 Una lectura; JSONL semiestructurado &
-15.540.132 filas; 1.450 archivos; 113 MB gz &
+15.540.132 filas; 1.449 archivos; 115 MB gz &
 Lotes por sincronización, archivados por hora de recepción;
 basta con que estén al corte diario.\\
 Sesiones &
 Una actividad; JSONL &
-4.840 filas; 764 KB &
+4.840 filas; 779 KB &
 Evento al cerrar la sesión; minutos.\\
 Comidas &
 Una preparación; CSV estructurado &
-22.106 filas; 984 KB &
+22.106 filas; 1,0 MB &
 Transacción en línea desde la app; menos de 1 s.\\
 \bottomrule
 \end{tabularx}
@@ -176,16 +176,17 @@ Transacción en línea desde la app; menos de 1 s.\\
 
 \textbf{Crecimiento.} Con 315 relojes llegan unas 255 mil lecturas
 por día (cerca de 810 por reloj), es decir, 1,9 MB comprimidos al día
-y unos 56 MB al mes. Para otra cantidad de relojes se escala con
+y unos 57 MB al mes. Para otra cantidad de relojes se escala con
 $V_{\mathrm{dia}} = N_{\mathrm{relojes}} \cdot m_{\mathrm{dia}} \cdot b_{\mathrm{registro}}$,
-con $b_{\mathrm{registro}} \approx 7{,}5$ bytes comprimidos por lectura.
+con $b_{\mathrm{registro}} \approx 7{,}4$ bytes comprimidos por lectura.
 
 \textbf{Problemas detectados en los datos entregados.}
 \begin{itemize}
-    \item \emph{Duplicados}: 345.599 mediciones repetidas (2,2\,\%), con
-    valores idénticos; 300.015 reaparecen en otro lote con distinto
-    \codigo{ts\_recepcion}, de modo que la clave de deduplicación debe ser
-    (\codigo{device\_id}, \codigo{ts\_medicion}). Sin deduplicar, los pasos
+    \item \emph{Duplicados}: 345.599 mediciones repiten la clave
+    (\codigo{device\_id}, \codigo{ts\_medicion}) (2,2\,\%), siempre con
+    valores idénticos. Solo 45.584 son copias exactas de la fila; las
+    300.015 restantes reaparecen en otro lote con distinto
+    \codigo{ts\_recepcion}, por lo que se deduplica por esa clave. Sin deduplicar, los pasos
     se inflan 2,3\,\%. Hay además 48 sesiones duplicadas exactas.
     \item \emph{Atrasos}: entre la medición y la recepción hay una mediana
     de 1,2 h, un percentil 90 de 6,5 h, un percentil 99 de 32 h y un máximo
@@ -386,7 +387,10 @@ entrenamiento, validación y prueba. Para evitar fugas, cada predicción
 del día $d+1$ usará solo lecturas con \codigo{ts\_recepcion} anterior
 al corte de las 00:00 locales; dado el atraso observado, el día $d$
 llega incompleto al corte, y así se reproducirá también en
-entrenamiento. Con unos 113 MB comprimidos, el caso no justifica hoy
+entrenamiento (A3 usa una versión de los hechos al corte). Las
+variables se calculan sobre un calendario continuo, y los días
+objetivo sin cobertura mínima se excluyen, en lugar de tratarse como
+cero pasos. Con unos 115 MB comprimidos, el caso no justifica hoy
 procesamiento distribuido.
 
 % ============================================================
@@ -636,6 +640,9 @@ nuevo. \textbf{Propósito:} reemplazar el reloj activo de un usuario.
 \begin{lstlisting}[language=SQL]
 BEGIN;
 
+-- 0. Serializar los cambios de reloj del mismo usuario
+SELECT 1 FROM usuarios WHERE AuthorId = :usuario FOR UPDATE;
+
 -- 1. Cerrar la vinculacion activa del usuario (si existe)
 UPDATE vinculaciones
 SET hasta = now()
@@ -664,6 +671,14 @@ y los pasos de ese día se sumarían dos veces.
 \textbf{Qué la acelera:} índices únicos parciales
 \codigo{(AuthorId) WHERE hasta IS NULL} y
 \codigo{(device\_id) WHERE hasta IS NULL}, que además imponen la regla.
+\textbf{Concurrencia:} los índices protegen la integridad incluso con
+dos cambios simultáneos del mismo usuario: la segunda transacción
+espera a la primera y luego falla por la clave única, así que nunca
+quedan dos relojes activos. Pero esa transacción termina en error.
+Para serializar ambos cambios de forma ordenada, T1 bloquea primero la
+fila del usuario (\codigo{SELECT ... FOR UPDATE}); si aun así recibe un
+error (por ejemplo, porque el reloj está activo en otro usuario), la
+app revierte la transacción e informa o reintenta.
 
 \subsection{T2. Registrar una comida}
 
@@ -774,34 +789,57 @@ que reutiliza A3.
 \subsection{A3. Dataset para predecir pasos (responde el objetivo)}
 
 \textbf{Usuario:} proceso de entrenamiento y de predicción diaria.
-Supone una tabla diaria continua por usuario, con una política
-explícita para los días sin lecturas (cobertura igual a cero).
+
+La consulta usa dos versiones de la tabla de hechos, ambas construidas
+en la capa analítica:
+\begin{itemize}
+    \item \codigo{fact\_actividad\_al\_corte}: para cada fecha $d$, se
+    recalcula solo con las lecturas cuya \codigo{ts\_recepcion} es
+    anterior al corte (00:00 local de $d+1$). De aquí salen las
+    \emph{variables}.
+    \item \codigo{fact\_actividad\_diaria}: la versión final, con todas
+    las lecturas recibidas. De aquí sale el \emph{objetivo}.
+\end{itemize}
+Además, se genera un \textbf{calendario continuo}: un día por usuario
+dentro de su período de vinculación. Un día sin lecturas queda con
+pasos nulos y cobertura cero, \emph{no} con cero pasos. Así la ventana
+de 7 filas equivale a 7 días calendario, y el objetivo es el día
+calendario siguiente, no la siguiente fila con datos.
 
 \begin{lstlisting}[language=SQL]
-WITH base AS (
-    SELECT a.usuario_key, a.fecha_key, a.pasos_totales,
-           a.minutos_con_lectura, a.cantidad_sesiones,
-           COALESCE(c.energia_preparada, 0) AS energia_preparada
-    FROM fact_actividad_diaria a
-    LEFT JOIN comidas_dia c          -- resumen materializado de A2
-           ON c.usuario_key = a.usuario_key
-          AND c.fecha_key   = a.fecha_key
+WITH calendario AS (       -- un dia por usuario dentro de su vinculacion
+    SELECT v.usuario_key, f.fecha_key
+    FROM periodos_vinculacion v
+    JOIN dim_fecha f ON f.fecha BETWEEN v.desde_local AND v.hasta_local
+),
+base AS (
+    SELECT k.usuario_key, k.fecha_key,
+           a.pasos_totales,                      -- NULL si no hubo lecturas
+           COALESCE(a.minutos_con_lectura, 0) AS cobertura_min,
+           COALESCE(a.cantidad_sesiones, 0)   AS cantidad_sesiones,
+           COALESCE(c.energia_preparada, 0)   AS energia_preparada
+    FROM calendario k
+    LEFT JOIN fact_actividad_al_corte a
+           ON a.usuario_key = k.usuario_key AND a.fecha_key = k.fecha_key
+    LEFT JOIN comidas_dia c                       -- resumen materializado de A2
+           ON c.usuario_key = k.usuario_key AND c.fecha_key = k.fecha_key
 ),
 variables AS (
     SELECT *,
-        AVG(pasos_totales) OVER w7       AS promedio_pasos_7d,
-        SUM(cantidad_sesiones) OVER w7   AS sesiones_7d,
-        SUM(energia_preparada) OVER w7   AS energia_preparada_7d,
-        LEAD(pasos_totales, 1) OVER (
-            PARTITION BY usuario_key ORDER BY fecha_key
-        ) AS pasos_dia_siguiente                 -- objetivo
+        AVG(pasos_totales)     OVER w7 AS promedio_pasos_7d,  -- ignora NULL
+        SUM(cobertura_min)     OVER w7 AS cobertura_7d,
+        SUM(cantidad_sesiones) OVER w7 AS sesiones_7d,
+        SUM(energia_preparada) OVER w7 AS energia_preparada_7d
     FROM base
     WINDOW w7 AS (PARTITION BY usuario_key ORDER BY fecha_key
                   ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
 )
-SELECT *
-FROM variables
-WHERE pasos_dia_siguiente IS NOT NULL;
+SELECT v.*, o.pasos_totales AS pasos_dia_siguiente      -- objetivo
+FROM variables v
+JOIN fact_actividad_diaria o                             -- version final
+  ON o.usuario_key = v.usuario_key
+ AND o.fecha_key   = v.fecha_key + 1     -- fecha_key: entero correlativo por dia
+WHERE o.minutos_con_lectura >= :cobertura_minima;
 \end{lstlisting}
 
 \textbf{Clasificación: OLAP.} Es un batch que ordena el historial de
@@ -810,12 +848,20 @@ corre a diario o en cada entrenamiento y tolera minutos.
 \textbf{Qué la acelera:} partición por fecha, lectura columnar y
 materialización de las variables.
 
+\textbf{Días sin cobertura.} Los días cuyo objetivo no alcanza la
+cobertura mínima se \emph{excluyen} del entrenamiento: no se sabe
+cuántos pasos dio el usuario y tratarlos como cero sesgaría el modelo.
+El umbral (minutos con lectura) se fijará en la E2 a partir de la
+distribución observada. Los días sin cobertura sí se mantienen en el
+calendario, de modo que las ventanas siguen siendo de 7 días.
+
 \textbf{Control de fuga.} Las variables usan solo días hasta $d$ y el
-objetivo es el día $d+1$. Además, la \codigo{fact\_actividad\_diaria}
-de entrenamiento se reconstruye con las lecturas cuya
-\codigo{ts\_recepcion} es anterior al corte (00:00 local de $d+1$).
-Así el modelo ve el día $d$ incompleto, igual que en producción,
-donde el 12\,\% de las lecturas llega después.
+objetivo es el día $d+1$. Las variables salen de
+\codigo{fact\_actividad\_al\_corte}, de modo que el modelo ve el día
+$d$ incompleto, igual que en producción, donde el 12\,\% de las
+lecturas llega después. Los días anteriores de la ventana también se
+toman en su versión al corte de cada uno. Eso es conservador: usan
+menos datos de los que habría al predecir, pero nunca datos futuros.
 
 \subsection{Consulta fronteriza: promedio reciente en la app}
 
@@ -852,10 +898,16 @@ calorias & calorias & kcal\\
 \begin{enumerate}
     \item Renombrar los campos al esquema común y convertir las fechas
     a \codigo{timestamp} UTC.
-    \item Deduplicar por (\codigo{device\_id}, \codigo{ts\_medicion}),
-    conservando la primera recepción. Se esperan 345.599 filas
-    eliminadas; la deduplicación por fila completa solo eliminaría
-    45.584.
+    \item Deduplicar por la \emph{clave lógica}
+    (\codigo{device\_id}, \codigo{ts\_medicion}), conservando la
+    recepción más temprana. Elimina 345.599 filas. Por comparación,
+    deduplicar por \emph{fila completa} (todas las columnas, incluida
+    \codigo{ts\_recepcion}) solo eliminaría 45.584: los 300.015
+    restantes son reenvíos que llegan con otra hora de recepción.
+    En los datos entregados ninguna clave repetida trae valores
+    distintos de pasos, calorías o frecuencia cardíaca. Si apareciera
+    alguna, se conservaría la recepción más temprana y el conflicto
+    se registraría como regla de calidad.
     \item Rechazar pasos o calorías negativos (hoy no hay casos).
     \item Aceptar frecuencia cardíaca nula y reportar la tasa
     (2,3\,\%).
@@ -878,18 +930,30 @@ anterior.
 \toprule
 \textbf{Magnitud} & \textbf{Valor}\\
 \midrule
-Recetas Food.com & 522.517 (170 MB Parquet).\\
-Reseñas Food.com & 1.401.982 de 271.907 usuarios (166 MB Parquet).\\
+Recetas Food.com & 522.517 (179 MB Parquet).\\
+Reseñas Food.com & 1.401.982 de 271.907 usuarios (174 MB Parquet).\\
 Relojes & 315 (198 Pulso S y 117 FitBand 2), 300 usuarios,
 15 desvinculados.\\
 Período & 61 días de recepción, del 16-dic-2007 al 14-feb-2008.\\
-Archivos de mediciones & 1.450 archivos horarios .jsonl.gz (113 MB).\\
+Archivos de mediciones & 1.449 archivos horarios .jsonl.gz (115 MB).\\
 Mediciones & 15.540.132 filas (15.194.533 tras deduplicar).\\
 Sesiones y comidas & 4.840 y 22.106 filas.\\
 Crecimiento con 315 relojes & unas 255 mil lecturas al día;
-1,9 MB al día y 56 MB al mes, comprimidos.\\
+1,9 MB al día y 57 MB al mes, comprimidos.\\
+Atraso de recepción & Mediana 1,2 h; percentil 90 de 6,5 h; percentil 99 de 32 h;
+máximo 105 h; 12\,\% llega otro día.\\
+\codigo{Calories} (Food.com) & Por porción. Si fuera por receta, crecería con
+\codigo{RecipeServings}, y no lo hace: la mediana es 227 kcal con 1 porción,
+349 con 4 y 156 con 24 (correlación $-0{,}09$).\\
 \bottomrule
 \end{tabularx}
+
+\textbf{Procedimiento.} Todas las cifras se obtuvieron con consultas
+DuckDB sobre los archivos entregados. El script
+\codigo{entregas/E1/anexos/inventario\_datos.py} del repositorio las
+reproduce: conteo de archivos y filas, unificación de los dos formatos
+de reloj, duplicados por clave y por fila completa, atrasos, nulos,
+referencias inexistentes y la verificación de \codigo{Calories}.
 
 Para un reloj con $h$ horas al día fuera de sesión y $s$ horas en
 sesión, el máximo teórico de lecturas es:
@@ -903,9 +967,11 @@ El promedio observado (unas 810 lecturas por reloj al día) queda bajo
 el máximo de Pulso S (1.440), lo que indica horas sin el reloj puesto.
 Por eso la cobertura se incluye como medida.
 
+\clearpage
 \section{Registro inicial de decisiones}
 
-\begin{longtable}{@{}p{2.6cm}p{4.9cm}p{6.5cm}@{}}
+{\renewcommand{\arraystretch}{1.25}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{6.1cm}>{\raggedright\arraybackslash}p{8.7cm}@{}}
 \toprule
 \textbf{Decisión} & \textbf{Alternativa elegida} &
 \textbf{Justificación}\\
@@ -926,15 +992,20 @@ Compresión, lectura columnar y poda por fecha.\\
 Arquitectura & Lakehouse &
 Separa las capas cruda, limpia y analítica a bajo costo.\\
 Escala & Procesamiento local &
-113 MB comprimidos; no hay evidencia que justifique distribuir.\\
+115 MB comprimidos; no hay evidencia que justifique distribuir.\\
 Deduplicación & Clave (device\_id, ts\_medicion) &
 300.015 duplicados llegan con otra hora de recepción.\\
 Temporalidad & UTC, más fecha local por vinculación &
 Asignar los pasos al día correcto del usuario.\\
 Validación ML & Corte por ts\_recepcion y separación temporal &
 Evita la fuga por lecturas que llegan tarde.\\
+Días sin lecturas & Calendario continuo; objetivos sin cobertura
+mínima excluidos &
+No confundir un día sin reloj con un día de 0 pasos; ventanas de
+7 días calendario.\\
 \bottomrule
 \end{longtable}
+}
 
 \section{Fuentes y referencias}
 
@@ -947,8 +1018,8 @@ Evita la fuga por lecturas que llegan tarde.\\
     modelos de datos y arquitecturas analíticas.
     \item Equipo docente. \emph{LEEME.md y diccionario de datos del
     wearable}.
-    \item Food.com -- Recipes and Reviews.
-    \url{https://www.kaggle.com/datasets/irkaal/foodcom-recipes-and-reviews}
+    \item Food.com -- Recipes and Reviews. Kaggle, licencia CC0.\\
+    {\small\url{https://www.kaggle.com/datasets/irkaal/foodcom-recipes-and-reviews}}
 \end{enumerate}
 
 \end{document}
