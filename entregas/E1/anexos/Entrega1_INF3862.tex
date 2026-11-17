@@ -218,7 +218,7 @@ reglas de calidad antes de consultar.
 \midrule
 Usuario &
 \codigo{AuthorId} (PK), fecha de alta, meta de pasos. &
-Relacional: integridad de FK.\\
+Relacional (FK).\\
 Reloj &
 \codigo{device\_id} (PK), modelo. &
 Relacional.\\
@@ -232,7 +232,7 @@ proteína, porciones; ingredientes como lista JSON. &
 Relacional con columnas documentales.\\
 Comida &
 \codigo{comida\_id} (PK), \codigo{AuthorId} (FK), \codigo{RecipeId} (FK),
-fecha y hora, porciones $> 0$. &
+fecha y hora de preparación, hora de registro, porciones $> 0$. &
 Relacional: escritura puntual.\\
 Sesión &
 \codigo{session\_id} (PK), \codigo{device\_id} (FK), tipo, inicio, fin,
@@ -271,9 +271,11 @@ entidad-relación está en el Anexo~\ref{an:er}.
 calorías de actividad, minutos con lectura (cobertura), cantidad y
 duración de sesiones.\\
 \codigo{fact\_comida} &
-\textbf{Una fila por comida registrada.} Claves: \codigo{usuario\_key},
-\codigo{fecha\_key}, \codigo{receta\_key}. Medidas: porciones, energía
-preparada (porciones $\times$ \codigo{Calories}).\\
+\textbf{Una fila por comida registrada}, identificada por
+\codigo{comida\_id} (la misma receta puede repetirse en un día). Claves:
+\codigo{usuario\_key}, \codigo{fecha\_key}, \codigo{receta\_key}.
+Medidas: porciones y energía (porciones $\times$ \codigo{Calories});
+atributo: hora de registro.\\
 \codigo{dim\_usuario} &
 \codigo{AuthorId}, zona horaria, modelo del reloj activo, meta de pasos.\\
 \codigo{dim\_fecha} &
@@ -378,20 +380,17 @@ está en el Anexo~\ref{an:arq}.
 
 \seccion{7. Proyección}
 
-En la E2 se implementará el pipeline sobre una muestra, con las reglas
-de calidad de la sección 2 (con su conteo de registros afectados), la
-capa limpia particionada en Parquet y las consultas A1--A3. En la E3
-se entrenará un modelo base frente a la referencia del promedio
-histórico, con separación temporal de 42, 9 y 9 días para
-entrenamiento, validación y prueba. Para evitar fugas, cada predicción
-del día $d+1$ usará solo lecturas con \codigo{ts\_recepcion} anterior
-al corte de las 00:00 locales; dado el atraso observado, el día $d$
-llega incompleto al corte, y así se reproducirá también en
-entrenamiento (A3 usa una versión de los hechos al corte). Las
-variables se calculan sobre un calendario continuo, y los días
-objetivo sin cobertura mínima se excluyen, en lugar de tratarse como
-cero pasos. Con unos 115 MB comprimidos, el caso no justifica hoy
-procesamiento distribuido.
+En la E2 se implementará el pipeline sobre una muestra: reglas de
+calidad de la sección 2 con su conteo, capa limpia en Parquet
+particionado y consultas A1--A3. En la E3 se entrenará un modelo base
+frente al promedio histórico, con separación temporal de 42, 9 y 9
+días. Para evitar fugas, la predicción del día $d+1$ usará solo
+lecturas recibidas y comidas registradas antes de las 00:00 locales;
+el día $d$ llega incompleto al corte y así se reproducirá en
+entrenamiento. Las variables usan un calendario continuo y se excluyen
+los objetivos sin cobertura mínima, en vez de tratarlos como cero
+pasos. Con 115 MB comprimidos, el caso no justifica hoy procesamiento
+distribuido.
 
 % ============================================================
 % ANEXOS - NO CUENTAN EN LAS 3 PÁGINAS DEL INFORME
@@ -431,7 +430,8 @@ fecha\_alta, meta\_pasos};
 {\textbf{COMIDA}\\
 PK: comida\_id\\
 FK: AuthorId, RecipeId\\
-fecha\_hora, porciones};
+fecha\_hora, registrado\_en\\
+porciones};
 
 \node[entity] (receta) at (5.6,0)
 {\textbf{RECETA}\\
@@ -610,7 +610,8 @@ mes};
 comida\_id\\
 usuario\_key, fecha\_key\\
 receta\_key\\
-porciones, energia\_kcal};
+porciones, energia\_kcal\\
+registrado\_en};
 
 \node[dim] (r) at (5.6,-3.6)
 {\textbf{DIM\_RECETA}\\
@@ -671,14 +672,17 @@ y los pasos de ese día se sumarían dos veces.
 \textbf{Qué la acelera:} índices únicos parciales
 \codigo{(AuthorId) WHERE hasta IS NULL} y
 \codigo{(device\_id) WHERE hasta IS NULL}, que además imponen la regla.
-\textbf{Concurrencia:} los índices protegen la integridad incluso con
-dos cambios simultáneos del mismo usuario: la segunda transacción
-espera a la primera y luego falla por la clave única, así que nunca
-quedan dos relojes activos. Pero esa transacción termina en error.
-Para serializar ambos cambios de forma ordenada, T1 bloquea primero la
-fila del usuario (\codigo{SELECT ... FOR UPDATE}); si aun así recibe un
-error (por ejemplo, porque el reloj está activo en otro usuario), la
-app revierte la transacción e informa o reintenta.
+\textbf{Concurrencia.} Hay dos mecanismos con funciones distintas.
+El \emph{bloqueo} de la fila del usuario (\codigo{SELECT ... FOR UPDATE})
+serializa los cambios de un mismo usuario: si llegan dos a la vez, el
+segundo espera a que el primero confirme y luego se ejecuta completo,
+cerrando la vinculación que el primero acaba de crear e insertando la
+suya. Ambos terminan bien y queda activo el último reloj. Los
+\emph{índices únicos parciales} garantizan la regla en cualquier caso:
+nunca puede haber dos vinculaciones activas del mismo usuario ni del
+mismo reloj. Si el reloj nuevo ya está activo en otro usuario, el
+\codigo{INSERT} viola el índice sobre \codigo{device\_id}; la
+transacción se revierte y la app lo informa.
 
 \subsection{T2. Registrar una comida}
 
@@ -686,8 +690,11 @@ app revierte la transacción e informa o reintenta.
 
 \begin{lstlisting}[language=SQL]
 INSERT INTO comidas (comida_id, AuthorId, RecipeId,
-                     fecha_hora, porciones)
-VALUES (:comida_id, :usuario, :receta, :fecha_hora, :porciones);
+                     fecha_hora, registrado_en, porciones)
+VALUES (:comida_id, :usuario, :receta,
+        :fecha_hora,   -- cuando se preparo (lo indica el usuario)
+        now(),         -- cuando se registro en la app
+        :porciones);
 -- Rechazada por la base si la receta no existe (FK)
 -- o si porciones <= 0 (CHECK)
 \end{lstlisting}
@@ -783,8 +790,8 @@ GROUP BY d.fin_de_semana;
 dimensión y agrega todo el historial (unas 22 mil comidas y 18 mil
 usuario-días; millones a escala). Es exploratoria, con baja
 concurrencia, y tolera segundos. \textbf{Qué la acelera:} formato
-columnar y materializar \codigo{comidas\_dia} como tabla resumen,
-que reutiliza A3.
+columnar y materializar \codigo{comidas\_dia} como tabla resumen;
+A3 usa su versión al corte.
 
 \subsection{A3. Dataset para predecir pasos (responde el objetivo)}
 
@@ -800,6 +807,15 @@ en la capa analítica:
     \item \codigo{fact\_actividad\_diaria}: la versión final, con todas
     las lecturas recibidas. De aquí sale el \emph{objetivo}.
 \end{itemize}
+Las comidas siguen la misma regla: \codigo{comidas\_dia\_al\_corte}
+agrega solo las comidas cuya \emph{hora de registro} en la app es
+anterior al corte, aunque se hayan preparado antes. Así, una cena
+registrada al día siguiente no entra en la predicción de ese día. Los
+datos entregados no traen la hora de registro (\codigo{comidas.csv}
+solo tiene \codigo{fecha\_hora} de preparación), por lo que en el
+historial se usa \codigo{fecha\_hora} como aproximación. Esa
+limitación queda registrada; en producción, la base operacional guarda
+la hora de registro.
 Además, se genera un \textbf{calendario continuo}: un día por usuario
 dentro de su período de vinculación. Un día sin lecturas queda con
 pasos nulos y cobertura cero, \emph{no} con cero pasos. Así la ventana
@@ -821,7 +837,7 @@ base AS (
     FROM calendario k
     LEFT JOIN fact_actividad_al_corte a
            ON a.usuario_key = k.usuario_key AND a.fecha_key = k.fecha_key
-    LEFT JOIN comidas_dia c                       -- resumen materializado de A2
+    LEFT JOIN comidas_dia_al_corte c        -- como A2, con registro < corte
            ON c.usuario_key = k.usuario_key AND c.fecha_key = k.fecha_key
 ),
 variables AS (
@@ -857,7 +873,8 @@ calendario, de modo que las ventanas siguen siendo de 7 días.
 
 \textbf{Control de fuga.} Las variables usan solo días hasta $d$ y el
 objetivo es el día $d+1$. Las variables salen de
-\codigo{fact\_actividad\_al\_corte}, de modo que el modelo ve el día
+\codigo{fact\_actividad\_al\_corte} y \codigo{comidas\_dia\_al\_corte},
+de modo que el modelo ve el día
 $d$ incompleto, igual que en producción, donde el 12\,\% de las
 lecturas llega después. Los días anteriores de la ventana también se
 toman en su versión al corte de cada uno. Eso es conservador: usan
